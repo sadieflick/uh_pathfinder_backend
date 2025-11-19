@@ -1,0 +1,385 @@
+"""
+Script to identify and fix misclassified program durations.
+
+Many 4-year bachelor's programs are incorrectly marked as 2-year programs
+because the scraped data often mentions "2 years" in the context of prerequisites
+or upper-division coursework.
+
+This script:
+1. Analyzes current duration distribution
+2. Identifies likely misclassified programs based on degree type keywords
+3. Optionally scrapes program URLs to verify actual duration
+4. Updates the database with corrected durations
+"""
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+import os
+import re
+from typing import Dict, List, Tuple
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Optional dependencies for scraping
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    SCRAPING_AVAILABLE = True
+except ImportError:
+    SCRAPING_AVAILABLE = False
+    print("Note: requests/beautifulsoup4 not installed. Scraping will be disabled.")
+    print("Install with: pip install requests beautifulsoup4")
+
+# Database connection
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL not set in environment")
+engine = create_engine(DATABASE_URL)
+
+
+def analyze_current_durations():
+    """Show current distribution of program durations by degree type."""
+    print("\n" + "="*80)
+    print("CURRENT PROGRAM DURATION DISTRIBUTION")
+    print("="*80)
+    
+    with engine.connect() as conn:
+        query = text("""
+            SELECT 
+                degree_type,
+                duration_years,
+                COUNT(*) as count
+            FROM public.program
+            GROUP BY degree_type, duration_years
+            ORDER BY degree_type, duration_years
+        """)
+        
+        results = conn.execute(query).fetchall()
+        
+        current_type = None
+        for row in results:
+            if current_type != row.degree_type:
+                current_type = row.degree_type
+                print(f"\n{current_type}")
+            print(f"  {row.duration_years} years: {row.count:3d} programs")
+
+
+def find_misclassified_programs() -> List[Dict]:
+    """Find programs that are likely misclassified based on degree type."""
+    print("\n" + "="*80)
+    print("IDENTIFYING LIKELY MISCLASSIFIED PROGRAMS")
+    print("="*80)
+    
+    with engine.connect() as conn:
+        # Find 2-year programs with bachelor's indicators
+        query = text("""
+            SELECT 
+                id,
+                name,
+                degree_type,
+                duration_years,
+                total_credits,
+                program_url,
+                description
+            FROM public.program
+            WHERE duration_years = 2 
+            AND (
+                degree_type ILIKE '%bachelor%'
+                OR degree_type ILIKE '%BS%'
+                OR degree_type ILIKE '%BA%'
+                OR degree_type ILIKE '%B.S.%'
+                OR degree_type ILIKE '%B.A.%'
+                OR degree_type ILIKE '%BBA%'
+                OR degree_type ILIKE '%BSE%'
+            )
+            ORDER BY name
+        """)
+        
+        results = conn.execute(query).fetchall()
+        
+        programs = []
+        for row in results:
+            programs.append({
+                'id': row.id,
+                'name': row.name,
+                'degree_type': row.degree_type,
+                'duration_years': row.duration_years,
+                'total_credits': row.total_credits,
+                'program_url': row.program_url,
+                'description': row.description
+            })
+        
+        print(f"\nFound {len(programs)} programs marked as 2-year with Bachelor's degree types")
+        
+        # Also check by credit hours (120+ credits typically = 4 years)
+        query2 = text("""
+            SELECT 
+                id,
+                name,
+                degree_type,
+                duration_years,
+                total_credits,
+                program_url
+            FROM public.program
+            WHERE duration_years = 2 
+            AND total_credits >= 100
+            ORDER BY total_credits DESC
+        """)
+        
+        results2 = conn.execute(query2).fetchall()
+        print(f"Found {len(results2)} programs marked as 2-year with 100+ credits")
+        
+        return programs
+
+
+def infer_duration_from_text(text: str) -> int:
+    """
+    Infer program duration from text content.
+    
+    Looks for patterns like:
+    - "4 years", "four years"
+    - "120 credits" (typically 4 years)
+    - "Associate" (2 years)
+    - "Bachelor" (4 years)
+    """
+    if not text:
+        return None
+    
+    text_lower = text.lower()
+    
+    # Explicit year mentions
+    if re.search(r'\b(four|4)[\s-]year', text_lower):
+        return 4
+    if re.search(r'\b(two|2)[\s-]year', text_lower):
+        return 2
+    
+    # Degree type indicators
+    if 'bachelor' in text_lower or ' bs ' in text_lower or ' ba ' in text_lower:
+        return 4
+    if 'associate' in text_lower or ' as ' in text_lower or ' aa ' in text_lower:
+        return 2
+    if 'certificate' in text_lower:
+        return 1
+    
+    # Credit hours (rough estimate: 30 credits/year)
+    credit_match = re.search(r'(\d+)\s*credit', text_lower)
+    if credit_match:
+        credits = int(credit_match.group(1))
+        if credits >= 100:
+            return 4
+        elif credits >= 50:
+            return 2
+        else:
+            return 1
+    
+    return None
+
+
+def scrape_program_duration(url: str) -> Tuple[int, str]:
+    """
+    Scrape a program URL to determine actual duration.
+    
+    Returns:
+        (duration_years, evidence_text)
+    """
+    if not SCRAPING_AVAILABLE:
+        return None, "Scraping dependencies not installed"
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Get main text content
+        text_content = soup.get_text(separator=' ', strip=True)
+        
+        # Look for duration indicators
+        duration = infer_duration_from_text(text_content)
+        
+        # Find evidence snippets
+        evidence_snippets = []
+        patterns = [
+            r'(\d+[\s-]year)',
+            r'(bachelor[^\.\n]{0,50})',
+            r'(\d+\s*credits?[^\.\n]{0,30})',
+            r'(associate[^\.\n]{0,50})',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text_content, re.IGNORECASE)
+            evidence_snippets.extend(matches[:2])  # Max 2 per pattern
+        
+        evidence = ' | '.join(evidence_snippets[:5]) if evidence_snippets else text_content[:200]
+        
+        return duration, evidence
+        
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+
+def analyze_programs(programs: List[Dict], scrape: bool = False) -> List[Dict]:
+    """
+    Analyze programs to determine correct duration.
+    
+    Args:
+        programs: List of program dicts
+        scrape: Whether to scrape URLs (slower but more accurate)
+    
+    Returns:
+        List of programs with recommended corrections
+    """
+    print("\n" + "="*80)
+    print("ANALYZING PROGRAMS")
+    print("="*80)
+    
+    corrections = []
+    
+    for i, prog in enumerate(programs):
+        print(f"\n[{i+1}/{len(programs)}] {prog['name']}")
+        print(f"  Current: {prog['duration_years']} years | Degree: {prog['degree_type']} | Credits: {prog['total_credits']}")
+        
+        # Infer from degree type
+        suggested_duration = None
+        confidence = "low"
+        evidence = []
+        
+        # Check degree type
+        degree_lower = prog['degree_type'].lower()
+        if 'bachelor' in degree_lower or 'b.s.' in degree_lower or 'b.a.' in degree_lower or 'bs' in degree_lower or 'ba' in degree_lower:
+            suggested_duration = 4
+            confidence = "high"
+            evidence.append(f"Degree type contains 'Bachelor': {prog['degree_type']}")
+        
+        # Check credits (120 credits is typical for 4-year degree)
+        if prog['total_credits'] and prog['total_credits'] >= 100:
+            suggested_duration = 4
+            confidence = "high" if confidence == "high" else "medium"
+            evidence.append(f"{prog['total_credits']} credits (typically 4-year)")
+        
+        # Check description
+        if prog['description']:
+            desc_duration = infer_duration_from_text(prog['description'])
+            if desc_duration and desc_duration != prog['duration_years']:
+                suggested_duration = desc_duration
+                evidence.append(f"Description suggests {desc_duration} years")
+        
+        # Scrape if requested
+        scraped_duration = None
+        if scrape and prog['program_url']:
+            print(f"  Scraping {prog['program_url'][:60]}...")
+            scraped_duration, scrape_evidence = scrape_program_duration(prog['program_url'])
+            if scraped_duration:
+                suggested_duration = scraped_duration
+                confidence = "very high"
+                evidence.append(f"Scraped: {scrape_evidence[:100]}")
+        
+        if suggested_duration and suggested_duration != prog['duration_years']:
+            corrections.append({
+                'id': prog['id'],
+                'name': prog['name'],
+                'current_duration': prog['duration_years'],
+                'suggested_duration': suggested_duration,
+                'confidence': confidence,
+                'evidence': ' | '.join(evidence)
+            })
+            print(f"  ✓ RECOMMEND: Change to {suggested_duration} years ({confidence} confidence)")
+        else:
+            print(f"  - No change recommended")
+    
+    return corrections
+
+
+def apply_corrections(corrections: List[Dict], dry_run: bool = True):
+    """
+    Apply duration corrections to the database.
+    
+    Args:
+        corrections: List of correction dicts
+        dry_run: If True, only show what would be changed
+    """
+    if not corrections:
+        print("\nNo corrections to apply.")
+        return
+    
+    print("\n" + "="*80)
+    if dry_run:
+        print("DRY RUN - CORRECTIONS THAT WOULD BE APPLIED")
+    else:
+        print("APPLYING CORRECTIONS")
+    print("="*80)
+    
+    for corr in corrections:
+        print(f"\nProgram: {corr['name']}")
+        print(f"  Change duration: {corr['current_duration']} → {corr['suggested_duration']} years")
+        print(f"  Confidence: {corr['confidence']}")
+        print(f"  Evidence: {corr['evidence'][:150]}")
+    
+    if dry_run:
+        print("\n" + "="*80)
+        print(f"DRY RUN COMPLETE - {len(corrections)} corrections identified")
+        print("Run with --apply flag to apply changes")
+        print("="*80)
+        return
+    
+    # Apply to database
+    with Session(engine) as session:
+        for corr in corrections:
+            update_query = text("""
+                UPDATE public.program
+                SET duration_years = :new_duration
+                WHERE id = :program_id
+            """)
+            session.execute(update_query, {
+                'new_duration': corr['suggested_duration'],
+                'program_id': corr['id']
+            })
+        
+        session.commit()
+        print(f"\n✓ Applied {len(corrections)} corrections to database")
+
+
+def main():
+    """Main function."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Fix misclassified program durations')
+    parser.add_argument('--analyze', action='store_true', help='Show current distribution')
+    parser.add_argument('--scrape', action='store_true', help='Scrape URLs to verify (slow)')
+    parser.add_argument('--apply', action='store_true', help='Apply corrections (default is dry-run)')
+    parser.add_argument('--limit', type=int, help='Limit number of programs to process')
+    
+    args = parser.parse_args()
+    
+    # Always show current state
+    analyze_current_durations()
+    
+    # Find misclassified programs
+    programs = find_misclassified_programs()
+    
+    if args.limit:
+        programs = programs[:args.limit]
+        print(f"\n(Limited to {args.limit} programs)")
+    
+    if not programs:
+        print("\nNo misclassified programs found!")
+        return
+    
+    # Analyze and get recommendations
+    corrections = analyze_programs(programs, scrape=args.scrape)
+    
+    # Apply or dry-run
+    apply_corrections(corrections, dry_run=not args.apply)
+
+
+if __name__ == "__main__":
+    main()

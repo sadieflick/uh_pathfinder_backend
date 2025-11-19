@@ -42,5 +42,3 @@ class AssessmentRepository:
         except Exception as e:
             print(f"Error: {e}")
             return []
-
-    # ... your other repo functions (like get_riasec_profile_data) ...
