@@ -7,6 +7,7 @@ from sqlalchemy import select
 from src.models.public_schema.occupation import Occupation
 from src.models.public_schema.program import Program
 from src.models.public_schema.associations import program_occupation_association
+from src.utils.text import fix_dict_encoding
 
 
 def get_programs_for_occupation(db: Session, onet_code: str) -> List[Dict[str, Any]]:
@@ -35,7 +36,7 @@ def get_programs_for_occupation(db: Session, onet_code: str) -> List[Dict[str, A
     # Convert to dictionaries
     result = []
     for program in programs:
-        result.append({
+        program_dict = {
             "id": program.id,
             "name": program.name,
             "description": program.description,
@@ -49,7 +50,9 @@ def get_programs_for_occupation(db: Session, onet_code: str) -> List[Dict[str, A
             "program_links": program.program_links,
             "prerequisites": program.prerequisites,
             "delivery_modes": program.delivery_modes,
-        })
+        }
+        # Fix any encoding issues in the program data
+        result.append(fix_dict_encoding(program_dict))
     
     return result
 
@@ -76,7 +79,7 @@ def get_occupation_details(db: Session, onet_code: str) -> Dict[str, Any] | None
     onet_stmt = select(OnetOccupation).where(OnetOccupation.onet_code == onet_code)
     onet_occ = db.execute(onet_stmt).scalar_one_or_none()
     
-    return {
+    occupation_dict = {
         "onet_code": occupation.onet_code,
         "title": onet_occ.title if onet_occ else None,
         "description": onet_occ.description if onet_occ else None,
@@ -87,6 +90,9 @@ def get_occupation_details(db: Session, onet_code: str) -> Dict[str, Any] | None
         "interest_scores": occupation.interest_scores,
         "onet_url": occupation.onet_url,
     }
+    
+    # Fix any encoding issues
+    return fix_dict_encoding(occupation_dict)
 
 
 def get_occupation_with_programs(db: Session, onet_code: str) -> Dict[str, Any] | None:
