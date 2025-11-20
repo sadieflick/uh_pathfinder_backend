@@ -1,5 +1,6 @@
 import logging
 import pytest
+from unittest.mock import MagicMock
 
 # Configure logging for tests
 def pytest_configure(config):
@@ -22,3 +23,8 @@ def test_logger():
     logger = logging.getLogger('test')
     logger.setLevel(logging.DEBUG)
     return logger
+
+@pytest.fixture
+def db_session():
+    """Provide a mock database session for tests that don't need a real DB."""
+    return MagicMock()

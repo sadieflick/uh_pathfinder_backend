@@ -104,6 +104,7 @@ my_fastapi_project/
 | (Future Search Feature) | `/api/v1/programs/search` | GET | User submits a free-text query (e.g., "computer programs on Maui"). Triggers the RAG pipeline (`program_service` → `vector_store`) and returns matching `Program` objects. |
 | (Future Browse Feature) | `/api/v1/sectors` | GET | Returns the list of all **9 Sectors**. |
 | (Future Browse Feature) | `/api/v1/sectors/{sector_id}/pathways` | GET | Returns all Pathways for a given Sector. |
+| Diagnostics | `/api/v1/apitest` | GET | Lightweight health endpoint that verifies API reachability and attempts a DB connectivity check. Returns `{ status, timestamp, app_name, db: { connected, dialect, error } }`. |
 
 ## New: Program Recommendations (Semantic)
 

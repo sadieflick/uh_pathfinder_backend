@@ -36,6 +36,12 @@ _TARGETED_REPLACEMENTS = {
     "—": "-",
     # Direct replacement for Ä in place names (appears as A-umlaut but should be a-macron)
     "MÄnoa": "Mānoa",  # Specific pattern in place names
+    # Additional Hawaiian place name variants seen in production
+    "Hawaiâi": "Hawaiʻi",
+    "HawaiÊ»i": "Hawaiʻi",
+    "Oâ\u0080\u0098ahu": "Oʻahu",
+    "Kapiʻolani": "Kapiʻolani",
+    "Kauaʻi": "Kauaʻi",
 }
 
 def _round_trip_repair(text: str) -> str:
