@@ -2,12 +2,14 @@
 
 from typing import List, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, desc
 
 from src.models.public_schema.occupation import Occupation
 from src.models.public_schema.program import Program
 from src.models.public_schema.associations import program_occupation_association
 from src.utils.text import fix_dict_encoding
+from src.models.onet_schema.skill import Skill
+from src.models.onet_schema.content_model_reference import ContentModelReference
 
 
 def get_programs_for_occupation(db: Session, onet_code: str) -> List[Dict[str, Any]]:
@@ -118,3 +120,28 @@ def get_occupation_with_programs(db: Session, onet_code: str) -> Dict[str, Any] 
         "programs": programs,
         "program_count": len(programs)
     }
+
+
+def get_top_skills_for_occupation(db: Session, onet_code: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Return top skills (IM scale) for an occupation sorted by data_value descending.
+
+    Args:
+        db: Database session
+        onet_code: O*NET SOC code (e.g., '11-1011.00')
+        limit: Max number of skills to return
+
+    Returns:
+        List of dicts: [{"element_id", "element_name", "score"}, ...]
+    """
+    stmt = (
+        select(Skill.element_id, ContentModelReference.element_name, Skill.data_value)
+        .join(ContentModelReference, ContentModelReference.element_id == Skill.element_id)
+        .where(Skill.onetsoc_code == onet_code)
+        .where(Skill.scale_id == 'IM')  # Importance scale
+        .order_by(desc(Skill.data_value))
+        .limit(limit)
+    )
+    rows = db.execute(stmt).all()
+    return [
+        {"element_id": r[0], "element_name": r[1], "score": r[2]} for r in rows
+    ]

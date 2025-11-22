@@ -1,5 +1,6 @@
-from typing import Dict, List, Iterable
+from typing import Dict, List, Iterable, Optional, Any
 import json
+import os
 from pathlib import Path
 
 from src.api.v1.schemas.assessment import (
@@ -56,45 +57,291 @@ class AssessmentService:
 
     # ---------------- Interest (RIASEC) -----------------
     def process_riasec_code(self, payload: RiasecCodeRequest, db: Session) -> RiasecResult:
-        """Return interest-filtered occupations + baseline skill panel.
+        """Return interest-filtered occupations with balanced composite scoring + baseline skill panel.
 
-        Uses permutation map to canonicalize code (avoids arbitrary alphabetical sorting) and
-        queries riasec schema for matched jobs with real titles from onet.occupation_data.
+        Uses enriched interest_job_signals table when available for balanced scoring that properly
+        represents all letters in the RIASEC code. Falls back to basic interest_matched_jobs ordering.
+        
+        Optionally integrates CareerOneStop SKA (Skills Matcher) ranking when include_ska=True.
+        
+        Scoring methodology:
+        - Fetches enriched signals with per-letter scores, positions, and presence flags
+        - Computes balanced composite interest score combining:
+          * interest_sum normalization (35%)
+          * balanced per-letter score - min of normalized letter scores (25%)
+          * coverage ratio - fraction of code letters in occupation's top-3 (20%)
+          * rarity bonus - inverse frequency weighting for underrepresented letters (20%)
+        - Optionally blends with SKA ranking when available
+        - Returns up to 150 occupations (configurable via limit param, default 50, max 150)
         """
         repo = RiasecRepository(db)
         canonical_code = canonical_riasec(payload.riasec_code)
-        # Determine how many jobs to return (default 10, clamp 1..50)
+        include_ska = getattr(payload, "include_ska", False)
+        
+        # Determine how many jobs to return (default 50, clamp 1..150 for enriched path)
         try:
-            limit = int(getattr(payload, "limit", 10) or 10)
+            limit = int(getattr(payload, "limit", 50) or 50)
         except Exception:
-            limit = 10
+            limit = 50
         if limit < 1:
             limit = 1
-        elif limit > 50:
-            limit = 50
-        profile = repo.get_profile(canonical_code)
-        if profile:
-            top_jobs_data = repo.top_matched_jobs(profile, limit=limit)
+        elif limit > 150:
+            limit = 150
+        
+        # Try enriched signals path first
+        signals = repo.get_enriched_interest_signals(canonical_code, limit=limit)
+        ska_available = False
+        skill_frequencies: Optional[Dict[str, int]] = None
+        
+        if signals:
+            # Use balanced composite scoring
+            if include_ska:
+                # Attempt SKA integration
+                scored_jobs, ska_available = self._compute_ska_enhanced_scores(
+                    signals, canonical_code, db
+                )
+            else:
+                scored_jobs = self._compute_balanced_scores(signals, canonical_code)
+            
+            # Get skill frequencies for this RIASEC code
+            skill_freq_rows = repo.get_interest_filtered_skills(canonical_code)
+            skill_frequencies = {
+                row["element_id"]: row["total_frequency"]
+                for row in skill_freq_rows
+            }
+            
+            top_jobs_data = scored_jobs[:limit]
             occupation_pool = [j["occ_code"] for j in top_jobs_data]
             top10_jobs = [
                 {
-                    "onet_code": j["occ_code"], 
+                    "onet_code": j["occ_code"],
                     "title": j["title"],
                     "median_salary": j.get("median_salary"),
-                    "growth_outlook": j.get("growth_outlook")
+                    "growth_outlook": j.get("growth_outlook"),
+                    "composite_score": j.get("composite_score"),
+                    "interest_sum": j.get("interest_sum"),
+                    "interests_count": j.get("interests_count"),
+                    "ska_rank": j.get("ska_rank"),
                 }
-                for j in top_jobs_data[:limit]
+                for j in top_jobs_data
             ]
         else:
-            occupation_pool = []
-            top10_jobs = []
+            # Fallback to basic ordering (legacy path)
+            profile = repo.get_profile(canonical_code)
+            if profile:
+                top_jobs_data = repo.top_matched_jobs(profile, limit=min(limit, 50))
+                occupation_pool = [j["occ_code"] for j in top_jobs_data]
+                top10_jobs = [
+                    {
+                        "onet_code": j["occ_code"], 
+                        "title": j["title"],
+                        "median_salary": j.get("median_salary"),
+                        "growth_outlook": j.get("growth_outlook")
+                    }
+                    for j in top_jobs_data
+                ]
+            else:
+                occupation_pool = []
+                top10_jobs = []
+        
         skills_panel = self._load_skill_definitions()
         return RiasecResult(
             riasec_code=canonical_code,
             occupation_pool=occupation_pool,
             top10_jobs=top10_jobs,  # type: ignore[arg-type]
             skills_panel=skills_panel,
+            skill_frequencies=skill_frequencies,
+            ska_available=ska_available if include_ska else None,
         )
+    
+    def _compute_balanced_scores(self, signals: List[Dict], code: str) -> List[Dict]:
+        """Compute balanced composite interest score for occupations.
+        
+        Uses enriched per-letter signals to create a balanced ranking that represents
+        all letters in the user's RIASEC code, preventing underrepresentation of any dimension.
+        
+        Parameters
+        ----------
+        signals : list of dict
+            Enriched signal rows from interest_job_signals table
+        code : str
+            RIASEC code (e.g., 'ACR')
+            
+        Returns
+        -------
+        list of dict
+            Occupations sorted by composite_score DESC, each with occ_code, title, 
+            median_salary, growth_outlook, composite_score fields
+        """
+        if not signals:
+            return []
+        
+        code_letters = [c.lower() for c in code]
+        max_interest_sum = float(max(s.get("interest_sum", 1) for s in signals) or 1)
+        
+        # Collect letter rarity (count how many occupations have each letter in top-3)
+        letter_counts: Dict[str, int] = {l: 0 for l in ["r","i","a","s","e","c"]}
+        for s in signals:
+            for l in letter_counts:
+                if s.get(f"contains_{l}"):
+                    letter_counts[l] += 1
+        max_possible_rarity = sum(1 / (letter_counts[l] or 1) for l in code_letters)
+        
+        # Precompute max scores per letter for normalization
+        max_letter_score: Dict[str, float] = {l: 0.0 for l in ["r","i","a","s","e","c"]}
+        for s in signals:
+            for l in max_letter_score:
+                val = float(s.get(f"score_{l}") or 0.0)
+                if val > max_letter_score[l]:
+                    max_letter_score[l] = val
+        
+        # Compute composite score for each occupation
+        scored = []
+        for s in signals:
+            interest_sum_norm = float(s.get("interest_sum", 0) or 0) / max_interest_sum
+            
+            # Balanced score: minimum of normalized per-letter scores (penalizes missing letters)
+            per_letter_norms = [
+                float(s.get(f"score_{l}") or 0.0) / (max_letter_score[l] or 1) 
+                for l in code_letters
+            ]
+            balanced_score = min(per_letter_norms) if per_letter_norms else 0.0
+            
+            # Coverage: fraction of code letters present in occupation's top-3
+            present_count = sum(1 for l in code_letters if s.get(f"contains_{l}"))
+            coverage_ratio = present_count / len(code_letters)
+            
+            # Rarity bonus: reward occupations with underrepresented letters
+            rarity_bonus = sum(
+                1 / (letter_counts[l] or 1) 
+                for l in code_letters 
+                if s.get(f"contains_{l}")
+            )
+            rarity_bonus_norm = (rarity_bonus / max_possible_rarity) if max_possible_rarity else 0.0
+            
+            # Composite: weighted blend
+            composite = (
+                0.35 * interest_sum_norm + 
+                0.25 * balanced_score + 
+                0.20 * coverage_ratio + 
+                0.20 * rarity_bonus_norm
+            )
+            
+            scored.append({
+                "occ_code": s["occ_code"],
+                "title": s.get("title"),
+                "median_salary": s.get("median_annual_wage"),
+                "growth_outlook": s.get("employment_outlook"),
+                "composite_score": round(composite, 5),
+                "interest_sum": s.get("interest_sum"),
+                "interests_count": s.get("interests_count"),
+            })
+        
+        # Sort by composite score descending
+        scored.sort(key=lambda x: x["composite_score"], reverse=True)
+        return scored
+    
+    def _compute_ska_enhanced_scores(
+        self, signals: List[Dict], code: str, db: Session
+    ) -> tuple[List[Dict], bool]:
+        """Compute SKA-enhanced composite scores by blending interest scores with CareerOneStop ranking.
+        
+        Parameters
+        ----------
+        signals : list of dict
+            Enriched signal rows from interest_job_signals table
+        code : str
+            RIASEC code (e.g., 'ACR')
+        db : Session
+            Database session for skill frequency queries
+            
+        Returns
+        -------
+        tuple[list of dict, bool]
+            (scored occupations sorted by composite_score DESC, ska_available flag)
+        """
+        # First compute interest-only scores
+        interest_scored = self._compute_balanced_scores(signals, code)
+        
+        # Attempt to get SKA rankings
+        ska_available = False
+        ska_rank_map: Dict[str, int] = {}
+        
+        # Check if COS credentials are available
+        from src.core.config import ONESTOP_USERID, ONESTOP_API_KEY
+        if ONESTOP_USERID and ONESTOP_API_KEY:
+            # Aggregate skill frequencies for SKA payload
+            repo = RiasecRepository(db)
+            skill_freq_rows = repo.get_interest_filtered_skills(code)
+            freq_map = {row["element_id"]: row["total_frequency"] for row in skill_freq_rows}
+            
+            # Build SKA payload
+            ska_payload = self._build_ska_payload(freq_map)
+            
+            # Call CareerOneStop API
+            assessment_repo = AssessmentRepository()
+            ska_results = assessment_repo.get_150_jobs_from_cos(ska_payload)
+            
+            if ska_results:
+                ska_available = True
+                # Build rank map (occ_code -> rank position)
+                for idx, job in enumerate(ska_results, 1):
+                    occ_code = job.get("OnetCode") or job.get("onet_code")
+                    if occ_code:
+                        ska_rank_map[occ_code] = idx
+        
+        # Merge SKA ranks into interest scores
+        if ska_available and ska_rank_map:
+            max_rank = len(ska_rank_map)
+            for job in interest_scored:
+                ska_rank = ska_rank_map.get(job["occ_code"])
+                if ska_rank:
+                    job["ska_rank"] = ska_rank
+                    # Blend SKA into composite: 60% interest + 40% SKA component
+                    interest_component = job["composite_score"]
+                    ska_score_norm = (max_rank - ska_rank + 1) / max_rank
+                    job["composite_score"] = round(
+                        0.6 * interest_component + 0.4 * ska_score_norm, 5
+                    )
+            
+            # Re-sort by updated composite score
+            interest_scored.sort(key=lambda x: x["composite_score"], reverse=True)
+        
+        return interest_scored, ska_available
+    
+    def _build_ska_payload(self, freq_map: Dict[str, int]) -> Dict[str, Any]:
+        """Build CareerOneStop SKA payload from skill frequency map.
+        
+        Parameters
+        ----------
+        freq_map : dict
+            Mapping of element_id -> total_frequency
+            
+        Returns
+        -------
+        dict
+            SKA payload with SKAValueList
+        """
+        skill_defs = self._load_skill_definitions()
+        skill_def_map = {d.element_id: d for d in skill_defs}
+        
+        ska_values = []
+        for element_id, frequency in freq_map.items():
+            skill_def = skill_def_map.get(element_id)
+            if skill_def:
+                # Normalize frequency to 1-5 scale (simple approach)
+                # Higher frequency = higher rating
+                max_freq = max(freq_map.values()) if freq_map else 1
+                normalized = (frequency / max_freq) * 4 + 1  # Scale to 1-5
+                rating = min(5.0, max(1.0, normalized))
+                
+                ska_values.append({
+                    "ElementId": element_id,
+                    "ElementName": skill_def.name,
+                    "SKARating": round(rating, 1)
+                })
+        
+        return {"SKAValueList": ska_values}
 
     # ---------------- Skill Weighting -----------------
     def compute_skill_weights(

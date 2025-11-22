@@ -137,3 +137,54 @@ my_fastapi_project/
 4. Task statements are adapted for analagous high-school appropriate levels of tasks, to provide an approximate measure of aptitude (or affinity) for future career requirements.
 5. Selecting "I've done this task before" further pre-rates 12 of the 40 skills (or more if they choose), downgrading or upgrading the score to start, based on whether or not they have performed a mid-level-competency task of this skill (anchor at 3 of 5)
 6. The next step uses LLM inference to collect approximated data about the tasks they have done to refine scores through open-ended questions using the skills anchor statements for skill-level as a basis for the judgment.
+
+## Confidence Scoring Workflow (Program–Occupation Links)
+
+We maintain `program_occupation_association` as the linking table between education programs and target occupations. A nullable `confidence` column has been added to support continuous validation and pruning of weak links.
+
+### Column Semantics
+- `NULL`: Link has not yet been evaluated by the LLM pass.
+- `0.0` (optional baseline): Explicitly marked as low confidence (if you choose to backfill).
+- `> 0.0` (currently we set `0.95`): High-confidence validated link retained by the cleanup job.
+
+### Migration Resolution
+Two divergent Alembic heads were merged (vector embedding path vs confidence addition) via merge revision `d1b7c4f9e123`. Future migrations should use that revision as their `down_revision`.
+
+### Scripts
+Location: `data_pipeline/processor/program_relevance_cleanup.py`
+Purpose: Batch LLM validation of existing links. For each occupation, the script:
+1. Sends a compact JSON list of candidate programs to the LLM.
+2. Receives a filtered list of valid program IDs.
+3. Sets `confidence=0.95` for valid links.
+4. Deletes invalid links (unless `--dry-run`).
+
+Optional Backfill Script: `src/scripts/backfill_confidence.py` (created if missing). Sets all `NULL` confidences to a baseline value.
+
+### Running the Workflow
+```bash
+# 1. Ensure migrations are up to date
+python -m alembic upgrade head
+
+# 2. (Optional) Backfill NULL confidences to 0.0 for clarity
+python src/scripts/backfill_confidence.py --baseline 0.0
+
+# 3. Dry run LLM validation (no DB writes, view planned changes)
+python data_pipeline/processor/program_relevance_cleanup.py --limit 10 --dry-run
+
+# 4. Execute full validation (writes confidence & prunes invalid links)
+python data_pipeline/processor/program_relevance_cleanup.py --limit 50
+
+# 5. Inspect results (example manual query)
+psql "$DATABASE_URL" -c "SELECT program_id, occupation_onet_code, confidence FROM program_occupation_association ORDER BY confidence NULLS LAST LIMIT 20;"
+```
+
+### Adjusting Confidence Thresholds
+Currently hard-coded to `0.95` for valid links. For nuanced scoring you could:
+- Return graded confidence values (e.g., 0.6–0.95) from the LLM.
+- Introduce a second pass to promote borderline links.
+- Keep deleted links in an audit table (future enhancement).
+
+### Next Enhancements
+- Add structured JSON schema enforcement in the LLM call (e.g., regex or pydantic validation).
+- Track evaluation timestamp & model used.
+- Differential re-validation only for stale links (older than X days).

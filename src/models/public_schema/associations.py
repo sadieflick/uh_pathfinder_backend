@@ -39,4 +39,11 @@ program_occupation_association = Table(
         default=datetime.now(),
         nullable=False
     )
+    ,
+    Column(
+        "confidence",
+        Float,
+        nullable=True,
+        doc="LLM or embedding-derived confidence score for this occupation-program linkage (0-1)."
+    )
 )

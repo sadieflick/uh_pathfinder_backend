@@ -8,7 +8,8 @@ from src.db.session import get_db
 from src.services.occupation_service import (
     get_programs_for_occupation,
     get_occupation_details,
-    get_occupation_with_programs
+    get_occupation_with_programs,
+    get_top_skills_for_occupation
 )
 
 router = APIRouter(prefix="/occupations", tags=["occupations"])
@@ -96,3 +97,27 @@ async def get_occupation_programs_summary(
             raise HTTPException(status_code=404, detail=f"Occupation {onet_code} not found")
     
     return programs
+
+
+@router.get("/{onet_code}/top-skills")
+async def get_occupation_top_skills(
+    onet_code: str,
+    limit: int = 5,
+    db: Session = Depends(get_db)
+) -> List[Dict[str, Any]]:
+    """Get top skills (Importance scale) for an occupation.
+
+    Args:
+        onet_code: O*NET SOC code
+        limit: Maximum number of skills to return (default 5)
+
+    Returns:
+        List of skill dicts: [{element_id, element_name, score}]
+    """
+    # Verify occupation exists
+    occupation = get_occupation_details(db, onet_code)
+    if not occupation:
+        raise HTTPException(status_code=404, detail=f"Occupation {onet_code} not found")
+
+    skills = get_top_skills_for_occupation(db, onet_code, limit=limit)
+    return skills

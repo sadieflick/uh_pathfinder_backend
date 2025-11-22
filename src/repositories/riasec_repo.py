@@ -50,6 +50,100 @@ class RiasecRepository:
             for row in results
         ]
 
+    def top_interest_matched_jobs(self, code: str, limit: int = 150) -> List[dict]:
+        """Return up to `limit` interest matched jobs for a RIASEC code ordered by:
+        1. interests_count DESC (number of profile interest letters present)
+        2. interest_sum DESC (aggregate score)
+
+        This mirrors the raw selection logic requested:
+        SELECT * FROM riasec.interest_matched_jobs
+        WHERE fk_riasec_code = :code
+        ORDER BY interests_count DESC, interest_sum DESC
+        LIMIT :limit;
+
+        We enrich with occupation title and optional wage/outlook.
+
+        Parameters
+        ----------
+        code : str
+            RIASEC 3-letter code (e.g. 'ACR'). Case-insensitive.
+        limit : int
+            Maximum rows to return (default 150, hard capped at 300).
+        """
+        limit = min(limit, 300)  # safety cap
+        query = text("""
+            SELECT 
+                imj.occ_code,
+                imj.interests_count,
+                imj.interest_sum,
+                od.title,
+                o.median_annual_wage,
+                o.employment_outlook
+            FROM riasec.interest_matched_jobs imj
+            JOIN onet.occupation_data od ON imj.occ_code = od.onetsoc_code
+            LEFT JOIN public.occupation o ON imj.occ_code = o.onet_code
+            WHERE UPPER(imj.fk_riasec_code) = UPPER(:code)
+            ORDER BY imj.interests_count DESC, imj.interest_sum DESC
+            LIMIT :limit
+        """)
+        rows = self.db.execute(query, {"code": code, "limit": limit}).all()
+        return [
+            {
+                "occ_code": r.occ_code,
+                "title": r.title,
+                "interests_count": r.interests_count,
+                "interest_sum": r.interest_sum,
+                "median_salary": r.median_annual_wage,
+                "growth_outlook": r.employment_outlook,
+            }
+            for r in rows
+        ]
+
+    def get_enriched_interest_signals(self, code: str, limit: int = 150) -> Optional[List[Dict]]:
+        """Fetch enriched interest signals from riasec.interest_job_signals if table exists.
+        
+        Returns list of dict rows with per-letter scores, positions, flags, or None if table missing.
+        
+        Parameters
+        ----------
+        code : str
+            RIASEC 3-letter code (e.g., 'ACR'). Case-insensitive.
+        limit : int
+            Maximum rows to return (default 150).
+        
+        Returns
+        -------
+        list of dict or None
+            Each dict contains: occ_code, score_r...score_c, contains_r...contains_c,
+            position_r...position_c, interest_sum, interests_count, plus joined title/salary/outlook.
+            None if table doesn't exist.
+        """        
+        # Check table existence
+        exists_query = text("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_schema='riasec' AND table_name='interest_job_signals'
+            )
+        """)
+        if not self.db.execute(exists_query).scalar():
+            return None
+        
+        query = text("""
+            SELECT 
+                sig.*,
+                od.title,
+                o.median_annual_wage,
+                o.employment_outlook
+            FROM riasec.interest_job_signals sig
+            JOIN onet.occupation_data od ON sig.occ_code = od.onetsoc_code
+            LEFT JOIN public.occupation o ON sig.occ_code = o.onet_code
+            WHERE UPPER(sig.fk_riasec_code) = UPPER(:code)
+            ORDER BY sig.interest_sum DESC, sig.interests_count DESC
+            LIMIT :limit
+        """)
+        rows = self.db.execute(query, {"code": code, "limit": limit}).mappings().all()
+        return [dict(r) for r in rows]
+
     def get_interest_filtered_skills(self, riasec_code: str) -> List[Dict[str, any]]:
         """Get skills ranked by frequency in interest-matched jobs for a RIASEC code.
         
